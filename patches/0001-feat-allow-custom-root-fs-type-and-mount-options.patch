@@ -1,0 +1,758 @@
+diff --git a/localization/strings/en-US/Resources.resw b/localization/strings/en-US/Resources.resw
+index c70dad5..c53cc82 100644
+--- a/localization/strings/en-US/Resources.resw
++++ b/localization/strings/en-US/Resources.resw
+@@ -436,6 +436,13 @@ Arguments for managing Windows Subsystem for Linux:
+             --from-file &lt;Path&gt;
+                 Install a distribution from a local file.
+ 
++            --fs-type
++                Specify the filesystem type to use for the distribution root.
++                Defaults to ext4.
++
++            --fs-mount-options
++                Specify additional mount options for the filesystem.
++
+             --legacy
+                 Use the legacy distribution manifest.
+ 
+@@ -551,6 +558,13 @@ Arguments for managing distributions in Windows Subsystem for Linux:
+                 Specifies that the provided file is a .vhd or .vhdx file, not a tar file.
+                 This operation makes a copy of the VHD file at the specified install location.
+ 
++            --fs-type
++                Specify the filesystem type to use for the distribution root.
++                Defaults to ext4.
++
++            --fs-mount-options
++                Specify additional mount options for the filesystem.
++
+     --import-in-place &lt;Distro&gt; &lt;FileName&gt;
+         Imports the specified VHD file as a new distribution.
+         This virtual hard disk must be formatted with the ext4 filesystem type.
+diff --git a/localization/strings/zh-CN/Resources.resw b/localization/strings/zh-CN/Resources.resw
+index c0e4e9e..8ed1f03 100644
+--- a/localization/strings/zh-CN/Resources.resw
++++ b/localization/strings/zh-CN/Resources.resw
+@@ -442,6 +442,13 @@
+             --from-file &lt;Path&gt;
+                 从本地文件安装发行版。
+ 
++            --fs-type
++                指定用于分发版根目录的文件系统类型。
++                默认为 ext4。
++
++            --fs-mount-options
++                指定根目录文件系统的其他装载选项。
++
+             --legacy
+                 使用旧发行版清单。
+ 
+@@ -557,6 +564,13 @@
+                 指定所提供的文件是 .vhd 还是 .vhdx 文件，而不是 tar 文件。
+                 此操作在指定的安装位置创建 VHD 文件的副本。
+ 
++            --fs-type
++                指定用于分发版根目录的文件系统类型。
++                默认为 ext4。
++
++            --fs-mount-options
++                指定根目录文件系统的其他装载选项。
++
+     --import-in-place &lt;Distro&gt; &lt;FileName&gt;
+         将指定的 VHD 文件作为新发行版导入。
+         必须使用 ext4 文件系统类型设置此虚拟硬盘的格式。
+diff --git a/src/linux/init/main.cpp b/src/linux/init/main.cpp
+index e8e8315..1c8b481 100644
+--- a/src/linux/init/main.cpp
++++ b/src/linux/init/main.cpp
+@@ -136,7 +136,8 @@ int EnableInterface(int Socket, const char* Name);
+ 
+ int ExportToSocket(const char* Source, int Socket, int ErrorSocket, unsigned int flags);
+ 
+-int FormatDevice(unsigned int Lun);
++int FormatDevice(unsigned int Lun, const char* FsType);
++int CreateBtrfsSubvolumeOnDevice(unsigned int Lun, const char* MountOptions);
+ 
+ std::string GetLunDeviceName(unsigned int Lun);
+ 
+@@ -901,19 +902,21 @@ Return Value:
+     return Result;
+ }
+ 
+-int FormatDevice(unsigned int Lun)
++int FormatDevice(unsigned int Lun, const char* FsType)
+ 
+ /*++
+ 
+ Routine Description:
+ 
+-    This routine formats the specified SCSI device with the ext4 file system.
+-    N.B. The group size was chosen based on the best practices for Linux VHDs:
++    This routine formats the specified SCSI device with the <FsType> file system.
++    N.B. The ext4 group size was chosen based on the best practices for Linux VHDs:
+          https://docs.microsoft.com/en-us/windows-server/virtualization/hyper-v/best-practices-for-running-linux-on-hyper-v
+ 
++    N.B. The xfs data section options (-d) is also determined based on the VHD sector size of 1MB, as suggested in the link above.
+ Arguments:
+ 
+     Lun - Supplies the LUN number of the SCSI device.
++    FsType - The filesystem type to format the device with.
+ 
+ Return Value:
+ 
+@@ -927,7 +930,30 @@ try
+ 
+     WaitForBlockDevice(DevicePath.c_str());
+ 
+-    std::string CommandLine = std::format("/usr/sbin/mkfs.ext4 -G 4096 '{}'", DevicePath);
++    if (FsType == nullptr)
++    {
++        FsType = "ext4";
++    }
++
++    std::string CommandLine;
++    if (strcmp(FsType, "ext4") == 0)
++    {
++        CommandLine = std::format("/usr/sbin/mkfs.ext4 -G 4096 '{}'", DevicePath);
++    }
++    else if (strcmp(FsType, "btrfs") == 0)
++    {
++        CommandLine = std::format("/usr/sbin/mkfs.btrfs '{}'", DevicePath);
++    }
++    else if (strcmp(FsType, "xfs") == 0)
++    {
++        CommandLine = std::format("/usr/sbin/mkfs.xfs -s size=4096 -d su=1m,sw=1 '{}'", DevicePath);
++    }
++    else
++    {
++        LOG_ERROR("Unsupported filesystem type: {}", FsType);
++        errno = ENOSYS;
++        return -1;
++    }
+     if (UtilExecCommandLine(CommandLine.c_str(), nullptr) < 0)
+     {
+         return -1;
+@@ -937,6 +963,74 @@ try
+ }
+ CATCH_RETURN_ERRNO()
+ 
++int CreateBtrfsSubvolumeOnDevice(unsigned int Lun, const char* MountOptions)
++/*++
++Routine Description:
++
++    This routine creates a btrfs subvolume on the specified SCSI device. No-op if there is no subvolume name in the mount options
++or the subvolume already exists. Arguments: Lun - Supplies the LUN number of the SCSI device. MountOptions - The mount options to
++use when mounting the device. Subvolume name is extracted from it. Return Value: 0 on success, < 0 on failure.
++--*/
++try
++{
++    if (MountOptions == nullptr)
++    {
++        return 0;
++    }
++
++    std::string_view options(MountOptions);
++    std::string_view subvolName;
++
++    size_t pos = 0;
++    while (pos < options.size())
++    {
++        size_t end = options.find(',', pos);
++        if (end == std::string_view::npos)
++        {
++            end = options.size();
++        }
++
++        std::string_view option = options.substr(pos, end - pos);
++        if (option.starts_with("subvol="))
++        {
++            subvolName = option.substr(7); // Skip "subvol="
++            break;
++        }
++
++        pos = end + 1;
++    }
++
++    if (subvolName.empty())
++    {
++        return 0;
++    }
++
++    std::string DevicePath = GetLunDevicePath(Lun);
++    std::string TempMountPath;
++    THROW_LAST_ERROR_IF(CreateTempDirectory("/tmp", TempMountPath) < 0);
++
++    auto unmountOnExit = wil::scope_exit([&TempMountPath]() {
++        umount(TempMountPath.c_str());
++        rmdir(TempMountPath.c_str());
++    });
++
++    THROW_LAST_ERROR_IF(UtilMount(DevicePath.c_str(), TempMountPath.c_str(), "btrfs", 0, nullptr, c_defaultRetryTimeout) < 0);
++
++    std::string SubvolPath = std::format("{}/{}", TempMountPath, subvolName);
++
++    struct stat st;
++    if (stat(SubvolPath.c_str(), &st) == 0)
++    {
++        return 0;
++    }
++
++    std::string CommandLine = std::format("/usr/sbin/btrfs subvolume create '{}'", SubvolPath);
++    THROW_LAST_ERROR_IF(UtilExecCommandLine(CommandLine.c_str(), nullptr) < 0);
++
++    return 0;
++}
++CATCH_RETURN_ERRNO()
++
+ std::string GetLunDeviceName(unsigned int Lun)
+ 
+ /*++
+@@ -2738,13 +2832,20 @@ void ProcessImportExportMessage(gsl::span<gsl::byte> Buffer, wsl::shared::Socket
+             ListenSocket = UtilListenVsockAnyPort(&ListenAddress, 2, true);
+             THROW_LAST_ERROR_IF(!ListenSocket);
+ 
++            auto* FsType = wsl::shared::string::FromSpan(Buffer, Message->FsTypeOffset);
++            auto* MountOptions = wsl::shared::string::FromSpan(Buffer, Message->MountOptionsOffset);
++
+             if (Message->Header.MessageType == LxMiniInitMessageImport)
+             {
+-                THROW_LAST_ERROR_IF(FormatDevice(Message->DeviceId) < 0);
++                THROW_LAST_ERROR_IF(FormatDevice(Message->DeviceId, FsType) < 0);
++            }
++
++            if (FsType != nullptr && strcmp(FsType, "btrfs") == 0)
++            {
++                // create the subvolume if specified in mount options
++                CreateBtrfsSubvolumeOnDevice(Message->DeviceId, MountOptions);
+             }
+ 
+-            auto* FsType = wsl::shared::string::FromSpan(Buffer, Message->FsTypeOffset);
+-            auto* MountOptions = wsl::shared::string::FromSpan(Buffer, Message->MountOptionsOffset);
+             THROW_LAST_ERROR_IF(MountDevice(Message->MountDeviceType, Message->DeviceId, DISTRO_PATH, FsType, Message->Flags, MountOptions) < 0);
+ 
+             Result = 0;
+diff --git a/src/windows/common/WslClient.cpp b/src/windows/common/WslClient.cpp
+index 72daeec..4eea28f 100644
+--- a/src/windows/common/WslClient.cpp
++++ b/src/windows/common/WslClient.cpp
+@@ -319,12 +319,16 @@ int ImportDistribution(_In_ std::wstring_view commandLine)
+     std::filesystem::path filePath;
+     ULONG flags = LXSS_IMPORT_DISTRO_FLAGS_NO_OOBE;
+     DWORD version = LXSS_WSL_VERSION_DEFAULT;
++    std::optional<std::wstring> fsType;
++    std::optional<std::wstring> fsMountOptions;
+ 
+     parser.AddPositionalArgument(name, 0);
+     parser.AddPositionalArgument(AbsolutePath(installPath), 1);
+     parser.AddPositionalArgument(filePath, 2);
+     parser.AddArgument(WslVersion(version), WSL_IMPORT_ARG_VERSION);
+     parser.AddArgument(SetFlag<ULONG, LXSS_IMPORT_DISTRO_FLAGS_VHD>{flags}, WSL_IMPORT_ARG_VHD);
++    parser.AddArgument(fsType, WSL_IMPORT_ARG_FS_TYPE);
++    parser.AddArgument(fsMountOptions, WSL_IMPORT_ARG_FS_MOUNT_OPTIONS);
+ 
+     parser.Parse();
+ 
+@@ -385,7 +389,15 @@ int ImportDistribution(_In_ std::wstring_view commandLine)
+     {
+         wsl::windows::common::HandleConsoleProgressBar progressBar(fileHandle, Localization::MessageImportProgress());
+         wsl::windows::common::SvcComm service;
+-        service.RegisterDistribution(name, version, fileHandle, installPath->c_str(), flags);
++        service.RegisterDistribution(
++            name,
++            version,
++            fileHandle,
++            installPath->c_str(),
++            flags,
++            std::nullopt,
++            fsType.has_value() ? fsType->c_str() : nullptr,
++            fsMountOptions.has_value() ? fsMountOptions->c_str() : nullptr);
+     }
+ 
+     directory_cleanup.release();
+@@ -458,6 +470,8 @@ int Install(_In_ std::wstring_view commandLine)
+     bool noDistribution = false;
+     bool legacy = false;
+     bool webDownload = IsWindowsServer();
++    std::optional<std::wstring> fsType;
++    std::optional<std::wstring> fsMountOptions;
+ 
+     ArgumentParser parser(std::wstring{commandLine}, WSL_BINARY_NAME);
+     parser.AddPositionalArgument(distroArgument, 0);
+@@ -475,6 +489,8 @@ int Install(_In_ std::wstring_view commandLine)
+     parser.AddArgument(g_promptBeforeExit, WSL_INSTALL_ARG_PROMPT_BEFORE_EXIT_OPTION);
+     parser.AddArgument(SizeString(vhdSize), WSL_INSTALL_ARG_VHD_SIZE);
+     parser.AddArgument(fixedVhd, WSL_INSTALL_ARG_FIXED_VHD);
++    parser.AddArgument(fsType, WSL_INSTALL_ARG_FS_TYPE);
++    parser.AddArgument(fsMountOptions, WSL_INSTALL_ARG_FS_MOUNT_OPTIONS);
+ 
+     parser.Parse();
+ 
+@@ -531,7 +547,9 @@ int Install(_In_ std::wstring_view commandLine)
+             file,
+             location.has_value() ? location->c_str() : nullptr,
+             fixedVhd ? LXSS_IMPORT_DISTRO_FLAGS_FIXED_VHD : 0,
+-            vhdSize);
++            vhdSize,
++            fsType.has_value() ? fsType->c_str() : nullptr,
++            fsMountOptions.has_value() ? fsMountOptions->c_str() : nullptr);
+ 
+         wsl::windows::common::wslutil::PrintMessage(Localization::MessageDistributionInstalled(installedName.get()), stdout);
+ 
+@@ -557,7 +575,7 @@ int Install(_In_ std::wstring_view commandLine)
+     if (!noDistribution && (legacy || !rebootRequired))
+     {
+         auto result = WslInstall::InstallDistribution(
+-            installResult, distroArgument, version, !noLaunchAfterInstall, webDownload, legacy, fixedVhd, name, location, vhdSize);
++            installResult, distroArgument, version, !noLaunchAfterInstall, webDownload, legacy, fixedVhd, name, location, vhdSize, fsType, fsMountOptions);
+ 
+         std::optional<std::wstring> flavor;
+         if (installResult.Distribution.has_value())
+diff --git a/src/windows/common/WslInstall.cpp b/src/windows/common/WslInstall.cpp
+index 1aab748..648f13d 100644
+--- a/src/windows/common/WslInstall.cpp
++++ b/src/windows/common/WslInstall.cpp
+@@ -101,7 +101,9 @@ HRESULT WslInstall::InstallDistribution(
+     _In_ bool fixedVhd,
+     _In_ const std::optional<std::wstring>& localName,
+     _In_ const std::optional<std::wstring>& location,
+-    _In_ const std::optional<uint64_t>& vhdSize)
++    _In_ const std::optional<uint64_t>& vhdSize,
++    _In_ const std::optional<std::wstring>& fsType,
++    _In_ const std::optional<std::wstring>& fsMountOptions)
+ try
+ {
+     wsl::windows::common::ExecutionContext context(wsl::windows::common::InstallDistro);
+@@ -143,7 +145,7 @@ try
+         if (const auto* distro = std::get_if<ModernDistributionVersion>(&*installResult.Distribution))
+         {
+             std::tie(installResult.Name, installResult.Id) =
+-                InstallModernDistribution(*distro, version, localName, location, vhdSize, fixedVhd);
++                InstallModernDistribution(*distro, version, localName, location, vhdSize, fixedVhd, fsType, fsMountOptions);
+ 
+             installResult.InstalledViaGitHub = true;
+         }
+@@ -153,7 +155,9 @@ try
+                 {localName.has_value(), WSL_INSTALL_ARG_NAME_LONG},
+                 {location.has_value(), WSL_INSTALL_ARG_LOCATION_LONG},
+                 {vhdSize.has_value(), WSL_INSTALL_ARG_VHD_SIZE},
+-                {fixedVhd, WSL_INSTALL_ARG_FIXED_VHD}};
++                {fixedVhd, WSL_INSTALL_ARG_FIXED_VHD},
++                {fsType.has_value(), WSL_INSTALL_ARG_FS_TYPE},
++                {fsMountOptions.has_value(), WSL_INSTALL_ARG_FS_MOUNT_OPTIONS}};
+ 
+             for (const auto& [condition, argument] : unsupportedArguments)
+             {
+@@ -272,7 +276,9 @@ std::pair<std::wstring, GUID> WslInstall::InstallModernDistribution(
+     const std::optional<std::wstring>& name,
+     const std::optional<std::wstring>& location,
+     const std::optional<uint64_t>& vhdSize,
+-    const bool fixedVhd)
++    const bool fixedVhd,
++    const std::optional<std::wstring>& fsType,
++    const std::optional<std::wstring>& fsMountOptions)
+ {
+     wsl::windows::common::SvcComm service;
+ 
+@@ -322,7 +328,9 @@ std::pair<std::wstring, GUID> WslInstall::InstallModernDistribution(
+         file.get(),
+         location.has_value() ? location->c_str() : nullptr,
+         fixedVhd ? LXSS_IMPORT_DISTRO_FLAGS_FIXED_VHD : 0,
+-        vhdSize);
++        vhdSize,
++        fsType.has_value() ? fsType->c_str() : nullptr,
++        fsMountOptions.has_value() ? fsMountOptions->c_str() : nullptr);
+ 
+     return {installedName.get(), id};
+ }
+\ No newline at end of file
+diff --git a/src/windows/common/WslInstall.h b/src/windows/common/WslInstall.h
+index beee2fa..89082d6 100644
+--- a/src/windows/common/WslInstall.h
++++ b/src/windows/common/WslInstall.h
+@@ -38,7 +38,9 @@ public:
+         _In_ bool fixedVhd,
+         _In_ const std::optional<std::wstring>& localName,
+         _In_ const std::optional<std::wstring>& location,
+-        _In_ const std::optional<uint64_t>& vhdSize);
++        _In_ const std::optional<uint64_t>& vhdSize,
++        _In_ const std::optional<std::wstring>& fsType,
++        _In_ const std::optional<std::wstring>& fsMountOptions);
+ 
+     static std::pair<bool, std::vector<std::wstring>> CheckForMissingOptionalComponents(_In_ bool requireWslOptionalComponent);
+ 
+@@ -50,5 +52,7 @@ public:
+         const std::optional<std::wstring>& name,
+         const std::optional<std::wstring>& location,
+         const std::optional<uint64_t>& vhdSize,
+-        const bool fixedVhd);
++        const bool fixedVhd,
++        const std::optional<std::wstring>& fsType,
++        const std::optional<std::wstring>& fsMountOptions);
+ };
+diff --git a/src/windows/common/svccomm.cpp b/src/windows/common/svccomm.cpp
+index 7eb9d5d..5741c7c 100644
+--- a/src/windows/common/svccomm.cpp
++++ b/src/windows/common/svccomm.cpp
+@@ -914,6 +914,8 @@ std::pair<GUID, wil::unique_cotaskmem_string> wsl::windows::common::SvcComm::Reg
+     _In_ LPCWSTR TargetDirectory,
+     _In_ ULONG Flags,
+     _In_ std::optional<uint64_t> VhdSize,
++    _In_opt_ LPCWSTR FsType,
++    _In_opt_ LPCWSTR MountOptions,
+     _In_opt_ LPCWSTR PackageFamilyName) const
+ {
+     ClientExecutionContext context;
+@@ -939,6 +941,8 @@ std::pair<GUID, wil::unique_cotaskmem_string> wsl::windows::common::SvcComm::Reg
+             TargetDirectory,
+             Flags,
+             VhdSize.value_or(0),
++            FsType,
++            MountOptions,
+             PackageFamilyName,
+             &installedName,
+             context.OutError(),
+@@ -954,6 +958,8 @@ std::pair<GUID, wil::unique_cotaskmem_string> wsl::windows::common::SvcComm::Reg
+             TargetDirectory,
+             Flags,
+             VhdSize.value_or(0),
++            FsType,
++            MountOptions,
+             PackageFamilyName,
+             &installedName,
+             context.OutError(),
+diff --git a/src/windows/common/svccomm.hpp b/src/windows/common/svccomm.hpp
+index 3a6423a..2566504 100644
+--- a/src/windows/common/svccomm.hpp
++++ b/src/windows/common/svccomm.hpp
+@@ -86,6 +86,8 @@ public:
+         _In_ LPCWSTR TargetDirectory,
+         _In_ ULONG Flags,
+         _In_ std::optional<uint64_t> VhdSize = std::nullopt,
++        _In_opt_ LPCWSTR FsType = nullptr,
++        _In_opt_ LPCWSTR FsMountOptions = nullptr,
+         _In_opt_ LPCWSTR PackageFamilyName = nullptr) const;
+ 
+     HRESULT
+diff --git a/src/windows/inc/wsl.h b/src/windows/inc/wsl.h
+index ce4b9e4..2e81fea 100644
+--- a/src/windows/inc/wsl.h
++++ b/src/windows/inc/wsl.h
+@@ -29,6 +29,8 @@ Abstract:
+ #define WSL_EXPORT_ARG_VHD_OPTION L"--vhd"
+ #define WSL_HELP_ARG L"--help"
+ #define WSL_IMPORT_ARG L"--import"
++#define WSL_IMPORT_ARG_FS_MOUNT_OPTIONS L"--fs-mount-options"
++#define WSL_IMPORT_ARG_FS_TYPE L"--fs-type"
+ #define WSL_IMPORT_ARG_STDIN L"-"
+ #define WSL_IMPORT_ARG_VERSION L"--version"
+ #define WSL_IMPORT_ARG_VHD L"--vhd"
+@@ -40,6 +42,8 @@ Abstract:
+ #define WSL_INSTALL_ARG_FIXED_VHD L"--fixed-vhd"
+ #define WSL_INSTALL_ARG_FROM_FILE_OPTION L'f'
+ #define WSL_INSTALL_ARG_FROM_FILE_LONG L"--from-file"
++#define WSL_INSTALL_ARG_FS_MOUNT_OPTIONS L"--fs-mount-options"
++#define WSL_INSTALL_ARG_FS_TYPE L"--fs-type"
+ #define WSL_INSTALL_ARG_LEGACY_LONG L"--legacy"
+ #define WSL_INSTALL_ARG_LOCATION_OPTION L'l'
+ #define WSL_INSTALL_ARG_LOCATION_LONG L"--location"
+diff --git a/src/windows/service/exe/DistributionRegistration.cpp b/src/windows/service/exe/DistributionRegistration.cpp
+index bfda98c..2f9640b 100644
+--- a/src/windows/service/exe/DistributionRegistration.cpp
++++ b/src/windows/service/exe/DistributionRegistration.cpp
+@@ -57,7 +57,18 @@ DistributionRegistration DistributionRegistration::Open(HKEY LxssKey, const GUID
+ }
+ 
+ DistributionRegistration DistributionRegistration::Create(
+-    HKEY LxssKey, const std::optional<GUID>& Id, LPCWSTR Name, ULONG Version, LPCWSTR BasePath, ULONG Flags, ULONG DefaultUID, LPCWSTR PackageFamilyName, LPCWSTR VhdFileName, bool EnableOobe)
++    HKEY LxssKey,
++    const std::optional<GUID>& Id,
++    LPCWSTR Name,
++    ULONG Version,
++    LPCWSTR BasePath,
++    ULONG Flags,
++    ULONG DefaultUID,
++    LPCWSTR PackageFamilyName,
++    LPCWSTR VhdFileName,
++    LPCWSTR FsType,
++    LPCWSTR FsMountOptions,
++    bool EnableOobe)
+ {
+     std::wstring distroGuidString;
+     GUID distroId{};
+@@ -112,6 +123,32 @@ DistributionRegistration DistributionRegistration::Create(
+         distribution.Write(Property::VhdFileName, VhdFileName);
+     }
+ 
++    if (ARGUMENT_PRESENT(FsType))
++    {
++        distribution.Write(Property::FsType, FsType);
++    }
++
++    if (ARGUMENT_PRESENT(FsMountOptions))
++    {
++        distribution.Write(Property::FsMountOptions, FsMountOptions);
++    }
++    else if (ARGUMENT_PRESENT(FsType) && wcscmp(FsType, LXSS_DISTRO_DEFAULT_FS_TYPE) != 0)
++    {
++        // FsType-specific default mount options
++        if (wcscmp(FsType, L"ext4") == 0)
++        {
++            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_EXT4);
++        }
++        else if (wcscmp(FsType, L"btrfs") == 0)
++        {
++            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_BTRFS);
++        }
++        else if (wcscmp(FsType, L"xfs") == 0)
++        {
++            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_XFS);
++        }
++    }
++
+     // Dismiss the scope exit member so the key is persisted.
+     cleanup.release();
+     return distribution;
+diff --git a/src/windows/service/exe/DistributionRegistration.h b/src/windows/service/exe/DistributionRegistration.h
+index 61fc161..81e3fb6 100644
+--- a/src/windows/service/exe/DistributionRegistration.h
++++ b/src/windows/service/exe/DistributionRegistration.h
+@@ -55,6 +55,8 @@ public:
+         ULONG DefaultUID,
+         LPCWSTR PackageFamilyName,
+         LPCWSTR VhdFileName,
++        LPCWSTR FsType,
++        LPCWSTR FsMountOptions,
+         bool EnableOobe);
+ 
+     static DistributionRegistration Open(HKEY LxssKey, const GUID& Id);
+@@ -91,6 +93,8 @@ namespace Property {
+     inline DistributionPropertyWithDefault<LPCWSTR> PackageFamilyName{L"PackageFamilyName", L""};
+     inline DistributionPropertyWithDefault<LPCWSTR> KernelCommandLine{L"KernelCommandLine", L""};
+     inline DistributionPropertyWithDefault<LPCWSTR> VhdFileName{L"VhdFileName", LXSS_VM_MODE_VHD_NAME};
++    inline DistributionPropertyWithDefault<LPCWSTR> FsType{L"FsType", LXSS_DISTRO_DEFAULT_FS_TYPE};
++    inline DistributionPropertyWithDefault<LPCWSTR> FsMountOptions{L"FsMountOptions", LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS};
+     inline ExpectedProperty<LPCWSTR> Name{L"DistributionName"};
+     inline ExpectedProperty<LPCWSTR> BasePath{L"BasePath"};
+     inline DistributionProperty<LPCWSTR> Flavor{L"Flavor"};
+diff --git a/src/windows/service/exe/LxssCreateProcess.h b/src/windows/service/exe/LxssCreateProcess.h
+index 8e1c704..8fd4bc6 100644
+--- a/src/windows/service/exe/LxssCreateProcess.h
++++ b/src/windows/service/exe/LxssCreateProcess.h
+@@ -110,6 +110,8 @@ typedef struct _LXSS_DISTRO_CONFIGURATION
+     std::filesystem::path BasePath;
+     std::wstring PackageFamilyName;
+     std::filesystem::path VhdFilePath;
++    std::wstring FsType;
++    std::wstring FsMountOptions;
+     ULONG Flags;
+     std::wstring Flavor;
+     std::wstring OsVersion;
+diff --git a/src/windows/service/exe/LxssUserSession.cpp b/src/windows/service/exe/LxssUserSession.cpp
+index 9f3a355..d518a58 100644
+--- a/src/windows/service/exe/LxssUserSession.cpp
++++ b/src/windows/service/exe/LxssUserSession.cpp
+@@ -383,6 +383,8 @@ HRESULT STDMETHODCALLTYPE LxssUserSession::RegisterDistribution(
+     _In_ LPCWSTR TargetDirectory,
+     _In_ ULONG Flags,
+     _In_ ULONG64 VhdSize,
++    _In_opt_ LPCWSTR FsType,
++    _In_opt_ LPCWSTR FsMountOptions,
+     _In_opt_ LPCWSTR PackageFamilyName,
+     _Out_ LPWSTR* InstalledDistributionName,
+     _Out_ LXSS_ERROR_INFO* Error,
+@@ -395,7 +397,7 @@ try
+     RETURN_HR_IF(RPC_E_DISCONNECTED, !session);
+ 
+     return session->RegisterDistribution(
+-        DistributionName, Version, FileHandle, ErrorHandle, TargetDirectory, Flags, VhdSize, PackageFamilyName, InstalledDistributionName, pDistroGuid);
++        DistributionName, Version, FileHandle, ErrorHandle, TargetDirectory, Flags, VhdSize, FsType, FsMountOptions, PackageFamilyName, InstalledDistributionName, pDistroGuid);
+ }
+ CATCH_RETURN()
+ 
+@@ -415,6 +417,8 @@ try
+         TargetDirectory,
+         0,
+         0,
++        nullptr,
++        nullptr,
+         packageFamilyName.empty() ? nullptr : packageFamilyName.c_str(),
+         nullptr,
+         nullptr,
+@@ -430,6 +434,8 @@ HRESULT STDMETHODCALLTYPE LxssUserSession::RegisterDistributionPipe(
+     _In_ LPCWSTR TargetDirectory,
+     _In_ ULONG Flags,
+     _In_ ULONG64 VhdSize,
++    _In_opt_ LPCWSTR FsType,
++    _In_opt_ LPCWSTR FsMountOptions,
+     _In_opt_ LPCWSTR PackageFamilyName,
+     _Out_ LPWSTR* InstalledDistributionName,
+     _Out_ LXSS_ERROR_INFO* Error,
+@@ -442,7 +448,7 @@ try
+     RETURN_HR_IF(RPC_E_DISCONNECTED, !session);
+ 
+     return session->RegisterDistribution(
+-        DistributionName, Version, PipeHandle, ErrorHandle, TargetDirectory, Flags, VhdSize, PackageFamilyName, InstalledDistributionName, pDistroGuid);
++        DistributionName, Version, PipeHandle, ErrorHandle, TargetDirectory, Flags, VhdSize, FsType, FsMountOptions, PackageFamilyName, InstalledDistributionName, pDistroGuid);
+ }
+ CATCH_RETURN()
+ 
+@@ -1297,6 +1303,8 @@ LxssUserSessionImpl::ImportDistributionInplace(_In_ LPCWSTR DistributionName, _I
+         LX_UID_ROOT,
+         nullptr,
+         path.filename().c_str(),
++        nullptr,
++        nullptr,
+         false);
+ 
+     auto configuration = s_GetDistributionConfiguration(registration);
+@@ -1350,6 +1358,8 @@ HRESULT LxssUserSessionImpl::RegisterDistribution(
+     _In_ LPCWSTR TargetDirectory,
+     _In_ ULONG Flags,
+     _In_ ULONG64 VhdSize,
++    _In_opt_ LPCWSTR FsType,
++    _In_opt_ LPCWSTR FsMountOptions,
+     _In_opt_ LPCWSTR PackageFamilyName,
+     _Out_opt_ LPWSTR* InstalledDistributionName,
+     _Out_ GUID* pDistroGuid)
+@@ -1488,6 +1498,8 @@ HRESULT LxssUserSessionImpl::RegisterDistribution(
+                 LX_UID_ROOT,
+                 PackageFamilyName,
+                 vhdName.c_str(),
++                FsType,
++                FsMountOptions,
+                 WI_IsFlagClear(Flags, LXSS_IMPORT_DISTRO_FLAGS_NO_OOBE));
+ 
+             configuration = s_GetDistributionConfiguration(registration, DistributionName == nullptr);
+@@ -2428,7 +2440,18 @@ void LxssUserSessionImpl::_CreateLegacyRegistration(_In_ HKEY LxssKey, _In_ HAND
+     const auto basePath = wsl::windows::common::filesystem::GetLegacyBasePath(UserToken);
+ 
+     DistributionRegistration::Create(
+-        LxssKey, LXSS_LEGACY_DISTRO_GUID, LXSS_LEGACY_INSTALL_NAME, LXSS_DISTRO_VERSION_LEGACY, basePath.c_str(), configFlags, defaultUid, nullptr, LXSS_VM_MODE_VHD_NAME, false);
++        LxssKey,
++        LXSS_LEGACY_DISTRO_GUID,
++        LXSS_LEGACY_INSTALL_NAME,
++        LXSS_DISTRO_VERSION_LEGACY,
++        basePath.c_str(),
++        configFlags,
++        defaultUid,
++        nullptr,
++        LXSS_VM_MODE_VHD_NAME,
++        nullptr,
++        nullptr,
++        false);
+ 
+     _SetDistributionInstalled(LxssKey, LXSS_LEGACY_DISTRO_GUID);
+ }
+@@ -2454,6 +2477,7 @@ std::vector<wsl::windows::common::filesystem::unique_lxss_addmount> LxssUserSess
+     return mounts;
+ }
+ 
++// TODO
+ _Requires_lock_not_held_(m_instanceLock)
+ std::shared_ptr<LxssRunningInstance> LxssUserSessionImpl::_CreateInstance(_In_opt_ LPCGUID DistroGuid, _In_ ULONG Flags)
+ {
+@@ -3987,6 +4011,8 @@ LxssUserSessionImpl::s_GetDistributionConfiguration(const DistributionRegistrati
+ 
+     // Read the vhd file name and append to the base path.
+     configuration.VhdFilePath = configuration.BasePath / Distro.Read(Property::VhdFileName);
++    configuration.FsType = Distro.Read(Property::FsType);
++    configuration.FsMountOptions = Distro.Read(Property::FsMountOptions);
+     configuration.Flags = Distro.Read(Property::Flags);
+ 
+     configuration.OsVersion = Distro.Read(Property::OsVersion).value_or(L"");
+diff --git a/src/windows/service/exe/LxssUserSession.h b/src/windows/service/exe/LxssUserSession.h
+index 6e2d416..bc95c6e 100644
+--- a/src/windows/service/exe/LxssUserSession.h
++++ b/src/windows/service/exe/LxssUserSession.h
+@@ -164,6 +164,8 @@ public:
+         _In_ LPCWSTR TargetDirectory,
+         _In_ ULONG Flags,
+         _In_ ULONG64 VhdSize,
++        _In_opt_ LPCWSTR FsType,
++        _In_opt_ LPCWSTR FsMountOptions,
+         _In_opt_ LPCWSTR PackageFamilyName,
+         _Out_ LPWSTR* InstalledDistributionName,
+         _Out_ LXSS_ERROR_INFO* Error,
+@@ -180,6 +182,8 @@ public:
+         _In_ LPCWSTR TargetDirectory,
+         _In_ ULONG Flags,
+         _In_ ULONG64 VhdSize,
++        _In_opt_ LPCWSTR FsType,
++        _In_opt_ LPCWSTR FsMountOptions,
+         _In_opt_ LPCWSTR PackageFamilyName,
+         _Out_ LPWSTR* InstalledDistributionName,
+         _Out_ LXSS_ERROR_INFO* Error,
+@@ -457,6 +461,8 @@ public:
+         _In_ LPCWSTR TargetDirectory,
+         _In_ ULONG Flags,
+         _In_ ULONG64 VhdSize,
++        _In_opt_ LPCWSTR FsType,
++        _In_opt_ LPCWSTR FsMountOptions,
+         _In_opt_ LPCWSTR PackageFamilyName,
+         _Out_opt_ LPWSTR* InstalledDistributionName,
+         _Out_ GUID* pDistroGuid);
+diff --git a/src/windows/service/exe/WslCoreInstance.cpp b/src/windows/service/exe/WslCoreInstance.cpp
+index 74fe316..6b32d3c 100644
+--- a/src/windows/service/exe/WslCoreInstance.cpp
++++ b/src/windows/service/exe/WslCoreInstance.cpp
+@@ -60,7 +60,7 @@ WslCoreInstance::WslCoreInstance(
+     if (result.Result != 0)
+     {
+         // N.B. EUCLEAN (117) can be returned if the disk's journal is corrupted.
+-        if ((result.Result == EINVAL || result.Result == 117) && result.FailureStep == LxInitCreateInstanceStepMountDisk)
++        if ((result.Result == 117) && result.FailureStep == LxInitCreateInstanceStepMountDisk)
+         {
+             THROW_HR(WSL_E_DISK_CORRUPTED);
+         }
+diff --git a/src/windows/service/exe/WslCoreVm.cpp b/src/windows/service/exe/WslCoreVm.cpp
+index 39552dd..f412dc1 100644
+--- a/src/windows/service/exe/WslCoreVm.cpp
++++ b/src/windows/service/exe/WslCoreVm.cpp
+@@ -1199,8 +1199,9 @@ std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateInstance(
+     message->MountDeviceType = LxMiniInitMountDeviceTypeLun;
+     message->DeviceId = lun;
+     message->Flags = flags;
+-    message.WriteString(message->FsTypeOffset, "ext4");
+-    message.WriteString(message->MountOptionsOffset, "discard,errors=remount-ro,data=ordered");
++    // TODO: add configuration for fsType and mountOptions
++    message.WriteString(message->FsTypeOffset, Configuration.FsType);
++    message.WriteString(message->MountOptionsOffset, Configuration.FsMountOptions);
+     message.WriteString(message->VmIdOffset, m_machineId);
+     message.WriteString(message->DistributionNameOffset, Configuration.Name);
+     message.WriteString(message->SharedMemoryRootOffset, sharedMemoryRoot);
+diff --git a/src/windows/service/inc/wslservice.idl b/src/windows/service/inc/wslservice.idl
+index c68ad75..d5dbd7b 100644
+--- a/src/windows/service/inc/wslservice.idl
++++ b/src/windows/service/inc/wslservice.idl
+@@ -99,6 +99,12 @@ cpp_quote("#define LXSS_DISTRO_DEFAULT_ENVIRONMENT \"HOSTTYPE=x86_64\0LANG=en_US
+ 
+ cpp_quote("#define LXSS_DISTRO_DEFAULT_KERNEL_COMMAND_LINE \"BOOT_IMAGE=/kernel init=/init\"")
+ 
++cpp_quote("#define LXSS_DISTRO_DEFAULT_FS_TYPE L\"ext4\"")
++cpp_quote("#define LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_EXT4 L\"discard,errors=remount-ro,data=ordered\"")
++cpp_quote("#define LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_BTRFS L\"discard\"")
++cpp_quote("#define LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_XFS L\"discard\"")
++cpp_quote("#define LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_EXT4")
++
+ cpp_quote("#define LXSS_DISTRO_FLAGS_ENABLE_INTEROP 0x1")
+ cpp_quote("#define LXSS_DISTRO_FLAGS_APPEND_NT_PATH 0x2")
+ cpp_quote("#define LXSS_DISTRO_FLAGS_ENABLE_DRIVE_MOUNTING 0x4")
+@@ -187,6 +193,8 @@ interface ILxssUserSession : IUnknown
+         [in, unique] LPCWSTR TargetDirectory,
+         [in] ULONG Flags,
+         [in] ULONG64 VhdSize,
++        [in, unique] LPCWSTR FsType,
++        [in, unique] LPCWSTR FsMountOptions,
+         [in, unique] LPCWSTR PackageFamilyName,
+         [out] LPWSTR* InstalledDistributionName,
+         [in, out] LXSS_ERROR_INFO* Error,
+@@ -201,6 +209,8 @@ interface ILxssUserSession : IUnknown
+         [in, unique] LPCWSTR TargetDirectory,
+         [in] ULONG Flags,
+         [in] ULONG64 VhdSize,
++        [in, unique] LPCWSTR FsType,
++        [in, unique] LPCWSTR FsMountOptions,
+         [in, unique] LPCWSTR PackageFamilyName,
+         [out] LPWSTR* InstalledDistributionName,
+         [in, out] LXSS_ERROR_INFO* Error,

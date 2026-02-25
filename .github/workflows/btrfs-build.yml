@@ -1,0 +1,310 @@
+name: Build WSL with BTRFS rootfs support
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 – UPDATE THE REPO AND APPLY THE BTRFS PATCH
+#
+# This workflow shows the full end-to-end process:
+#   1. Check out the latest code (or a specific ref/tag)
+#   2. Apply the BTRFS patch that lives in patches/ (idempotent when the
+#      changes are already present in the branch)
+#   3. Build for both x64 and ARM64
+#   4. Run the WSL unit-test suite
+#   5. Produce an msixbundle artefact that is ready to be side-loaded
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      wsl_ref:
+        description: 'Branch, tag, or SHA to build (defaults to the current branch)'
+        required: false
+        default: ''
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'Debug'
+        type: choice
+        options:
+          - Debug
+          - Release
+      run_tests:
+        description: 'Run unit tests after build'
+        required: false
+        default: true
+        type: boolean
+      build_bundle:
+        description: 'Build msixbundle (requires both x64 and ARM64 artefacts)'
+        required: false
+        default: true
+        type: boolean
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 – PREREQUISITES
+#
+# Self-hosted Windows runner requirements
+# ────────────────────────────────────────
+# The runner machine must have the following installed BEFORE the workflow runs:
+#
+#   1. Windows SDK 26100 (installed by Visual Studio or standalone)
+#
+#   2. Visual Studio 2022 with these individual components:
+#        - "Windows SDK 26100"
+#        - "MSBuild"
+#        - "Universal Windows platform support for v143 build tools (X64 and ARM64)"
+#        - "MSVC v143 – VS 2022 C++ ARM64 build tools (Latest + Spectre) (X64 & ARM64)"
+#        - "C++ core features"
+#        - "C++ ATL for latest v143 tools (X64 and ARM64)"
+#        - "C++ Clang compiler for Windows"
+#        - ".NET desktop development"
+#        - ".NET WinUI app development tools"
+#
+#      Quick install via Visual Studio Installer (adapt to your channel):
+#        vs_community.exe --add Microsoft.VisualStudio.Component.Windows11SDK.26100 ^
+#          --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 ^
+#          --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 ^
+#          --add Microsoft.VisualStudio.Component.VC.ATL ^
+#          --add Microsoft.VisualStudio.Component.VC.ATL.ARM64 ^
+#          --add Microsoft.VisualStudio.Component.VC.ClangToolset ^
+#          --add Microsoft.VisualStudio.Workload.NativeDesktop ^
+#          --add Microsoft.VisualStudio.Workload.Universal ^
+#          --add Microsoft.VisualStudio.Workload.ManagedDesktop ^
+#          --add Microsoft.VisualStudio.Component.WinUI
+#
+#   3. CMake >= 3.25
+#        winget install Kitware.CMake
+#
+#   4. Developer Mode enabled (required for symbolic-link support during build)
+#        Settings → System → For developers → Developer Mode → On
+#      OR run the build as Administrator.
+#
+#   5. The runner must be registered in GitHub with the label "self-hosted-windows"
+#      (or adjust the `runs-on` value below to match your runner label).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'Debug' }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # SECTION 3 – BUILD x64
+  # ───────────────────────────────────────────────────────────────────────────
+  build-x64:
+    name: Build WSL (x64)
+    runs-on: [self-hosted, windows, x64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.wsl_ref || github.ref }}
+
+      # ── Apply BTRFS patch (skip if changes are already present) ────────────
+      - name: Apply BTRFS patch
+        shell: pwsh
+        run: |
+          $patch = "patches\0001-feat-allow-custom-root-fs-type-and-mount-options.patch"
+          if (Test-Path $patch) {
+            # Check whether the patch is already applied by looking for a sentinel
+            $sentinel = Select-String -Path "src\windows\inc\wsl.h" `
+                          -Pattern "WSL_IMPORT_ARG_FS_TYPE" -Quiet
+            if (-not $sentinel) {
+              Write-Host "Applying BTRFS patch..."
+              git apply --whitespace=nowarn $patch
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "git apply failed. Review the patch for conflicts."
+                exit 1
+              }
+              Write-Host "Patch applied successfully."
+            } else {
+              Write-Host "BTRFS patch already applied – skipping."
+            }
+          } else {
+            Write-Warning "Patch file not found at $patch – building without applying patch."
+          }
+
+      # ── Generate Visual Studio solution ────────────────────────────────────
+      - name: Configure (CMake – x64)
+        shell: cmd
+        run: cmake . -A x64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      - name: Build (x64)
+        shell: cmd
+        # -m enables parallel MSBuild; the build typically takes 20-45 minutes.
+        run: cmake --build . --config ${{ env.BUILD_TYPE }} -- -m
+
+      # ── Upload artefacts ───────────────────────────────────────────────────
+      - name: Upload x64 artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-x64-${{ env.BUILD_TYPE }}
+          path: |
+            bin\x64\${{ env.BUILD_TYPE }}\wsl.msi
+            bin\x64\${{ env.BUILD_TYPE }}\*.msix
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SECTION 3 (continued) – BUILD ARM64
+  # ───────────────────────────────────────────────────────────────────────────
+  build-arm64:
+    name: Build WSL (ARM64)
+    runs-on: [self-hosted, windows, x64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.wsl_ref || github.ref }}
+
+      - name: Apply BTRFS patch
+        shell: pwsh
+        run: |
+          $patch = "patches\0001-feat-allow-custom-root-fs-type-and-mount-options.patch"
+          if (Test-Path $patch) {
+            $sentinel = Select-String -Path "src\windows\inc\wsl.h" `
+                          -Pattern "WSL_IMPORT_ARG_FS_TYPE" -Quiet
+            if (-not $sentinel) {
+              Write-Host "Applying BTRFS patch..."
+              git apply --whitespace=nowarn $patch
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "git apply failed. Review the patch for conflicts."
+                exit 1
+              }
+              Write-Host "Patch applied successfully."
+            } else {
+              Write-Host "BTRFS patch already applied – skipping."
+            }
+          }
+
+      - name: Configure (CMake – ARM64)
+        shell: cmd
+        run: cmake . -A arm64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build (ARM64)
+        shell: cmd
+        run: cmake --build . --config ${{ env.BUILD_TYPE }} -- -m
+
+      - name: Upload ARM64 artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-arm64-${{ env.BUILD_TYPE }}
+          path: |
+            bin\ARM64\${{ env.BUILD_TYPE }}\wsl.msi
+            bin\ARM64\${{ env.BUILD_TYPE }}\*.msix
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SECTION 4 – UNIT TESTS
+  #
+  # Tests require Administrator privileges.  The runner service must be
+  # configured to run as Administrator (or use a dedicated admin runner).
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests (x64)
+    runs-on: [self-hosted, windows, x64]
+    needs: build-x64
+    if: ${{ github.event.inputs.run_tests != 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.wsl_ref || github.ref }}
+
+      - name: Apply BTRFS patch
+        shell: pwsh
+        run: |
+          $patch = "patches\0001-feat-allow-custom-root-fs-type-and-mount-options.patch"
+          if (Test-Path $patch) {
+            $sentinel = Select-String -Path "src\windows\inc\wsl.h" `
+                          -Pattern "WSL_IMPORT_ARG_FS_TYPE" -Quiet
+            if (-not $sentinel) {
+              git apply --whitespace=nowarn $patch
+            }
+          }
+
+      - name: Configure (CMake – x64)
+        shell: cmd
+        run: cmake . -A x64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      # Full rebuild required so the test binary is consistent with all dlls
+      - name: Build (x64 – full rebuild for tests)
+        shell: cmd
+        run: cmake --build . --config ${{ env.BUILD_TYPE }} -- -m
+
+      # ── Run WSL unit tests ─────────────────────────────────────────────────
+      #
+      # test.bat wraps the TAEF (Test Authoring and Execution Framework) runner.
+      # /name:*UnitTest* selects the unit-test subset (fastest; ~5-15 min).
+      # Remove the /name filter to run the full suite (~30-60 min).
+      #
+      - name: Run unit tests
+        shell: cmd
+        # The test runner must be executed with Administrator privileges.
+        run: bin\x64\${{ env.BUILD_TYPE }}\test.bat /name:*UnitTest*
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-x64-${{ env.BUILD_TYPE }}
+          path: |
+            bin\x64\${{ env.BUILD_TYPE }}\*.log
+            bin\x64\${{ env.BUILD_TYPE }}\TestResults\**
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SECTION 5 – CREATE THE MSIXBUNDLE
+  #
+  # The bundle combines x64 and ARM64 packages into a single distributable
+  # .msixbundle file.  It requires both arch builds to succeed first.
+  # ───────────────────────────────────────────────────────────────────────────
+  bundle:
+    name: Create msixbundle
+    runs-on: [self-hosted, windows, x64]
+    needs: [build-x64, build-arm64]
+    if: ${{ github.event.inputs.build_bundle != 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.wsl_ref || github.ref }}
+
+      - name: Apply BTRFS patch
+        shell: pwsh
+        run: |
+          $patch = "patches\0001-feat-allow-custom-root-fs-type-and-mount-options.patch"
+          if (Test-Path $patch) {
+            $sentinel = Select-String -Path "src\windows\inc\wsl.h" `
+                          -Pattern "WSL_IMPORT_ARG_FS_TYPE" -Quiet
+            if (-not $sentinel) {
+              git apply --whitespace=nowarn $patch
+            }
+          }
+
+      # Build ARM64 first (bundle requires it per CMake docs)
+      - name: Configure (CMake – ARM64, Release, bundle mode)
+        shell: cmd
+        run: cmake . -A arm64 -DCMAKE_BUILD_TYPE=Release -DBUILD_BUNDLE=TRUE
+
+      - name: Build ARM64 for bundle
+        shell: cmd
+        run: cmake --build . --config Release -- -m
+
+      # Now build x64 with bundle enabled
+      - name: Configure (CMake – x64, Release, bundle mode)
+        shell: cmd
+        run: cmake . -A x64 -DCMAKE_BUILD_TYPE=Release -DBUILD_BUNDLE=TRUE
+
+      - name: Build x64 for bundle
+        shell: cmd
+        run: cmake --build . --config Release -- -m
+
+      - name: Upload msixbundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-msixbundle-${{ github.run_number }}
+          path: bin\**\*.msixbundle
+          retention-days: 30
