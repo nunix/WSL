@@ -136,11 +136,17 @@ DistributionRegistration DistributionRegistration::Create(
     {
         // FsType-specific default mount options
         if (wcscmp(FsType, L"ext4") == 0)
+        {
             distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_EXT4);
+        }
         else if (wcscmp(FsType, L"btrfs") == 0)
+        {
             distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_BTRFS);
+        }
         else if (wcscmp(FsType, L"xfs") == 0)
+        {
             distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_XFS);
+        }
     }
 
     // Dismiss the scope exit member so the key is persisted.

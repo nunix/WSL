@@ -2440,7 +2440,18 @@ void LxssUserSessionImpl::_CreateLegacyRegistration(_In_ HKEY LxssKey, _In_ HAND
     const auto basePath = wsl::windows::common::filesystem::GetLegacyBasePath(UserToken);
 
     DistributionRegistration::Create(
-        LxssKey, LXSS_LEGACY_DISTRO_GUID, LXSS_LEGACY_INSTALL_NAME, LXSS_DISTRO_VERSION_LEGACY, basePath.c_str(), configFlags, defaultUid, nullptr, LXSS_VM_MODE_VHD_NAME, nullptr, nullptr, false);
+        LxssKey,
+        LXSS_LEGACY_DISTRO_GUID,
+        LXSS_LEGACY_INSTALL_NAME,
+        LXSS_DISTRO_VERSION_LEGACY,
+        basePath.c_str(),
+        configFlags,
+        defaultUid,
+        nullptr,
+        LXSS_VM_MODE_VHD_NAME,
+        nullptr,
+        nullptr,
+        false);
 
     _SetDistributionInstalled(LxssKey, LXSS_LEGACY_DISTRO_GUID);
 }

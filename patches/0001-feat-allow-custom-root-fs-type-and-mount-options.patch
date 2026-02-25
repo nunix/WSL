@@ -457,7 +457,7 @@ index ce4b9e4..2e81fea 100644
  #define WSL_INSTALL_ARG_LOCATION_OPTION L'l'
  #define WSL_INSTALL_ARG_LOCATION_LONG L"--location"
 diff --git a/src/windows/service/exe/DistributionRegistration.cpp b/src/windows/service/exe/DistributionRegistration.cpp
-index bfda98c..02125e5 100644
+index bfda98c..2f9640b 100644
 --- a/src/windows/service/exe/DistributionRegistration.cpp
 +++ b/src/windows/service/exe/DistributionRegistration.cpp
 @@ -57,7 +57,18 @@ DistributionRegistration DistributionRegistration::Open(HKEY LxssKey, const GUID
@@ -480,7 +480,7 @@ index bfda98c..02125e5 100644
  {
      std::wstring distroGuidString;
      GUID distroId{};
-@@ -112,6 +123,26 @@ DistributionRegistration DistributionRegistration::Create(
+@@ -112,6 +123,32 @@ DistributionRegistration DistributionRegistration::Create(
          distribution.Write(Property::VhdFileName, VhdFileName);
      }
  
@@ -497,11 +497,17 @@ index bfda98c..02125e5 100644
 +    {
 +        // FsType-specific default mount options
 +        if (wcscmp(FsType, L"ext4") == 0)
++        {
 +            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_EXT4);
++        }
 +        else if (wcscmp(FsType, L"btrfs") == 0)
++        {
 +            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_BTRFS);
++        }
 +        else if (wcscmp(FsType, L"xfs") == 0)
++        {
 +            distribution.Write(Property::FsMountOptions, LXSS_DISTRO_DEFAULT_FS_MOUNT_OPTIONS_XFS);
++        }
 +    }
 +
      // Dismiss the scope exit member so the key is persisted.
@@ -543,7 +549,7 @@ index 8e1c704..8fd4bc6 100644
      std::wstring Flavor;
      std::wstring OsVersion;
 diff --git a/src/windows/service/exe/LxssUserSession.cpp b/src/windows/service/exe/LxssUserSession.cpp
-index 9f3a355..d78dd7d 100644
+index 9f3a355..d518a58 100644
 --- a/src/windows/service/exe/LxssUserSession.cpp
 +++ b/src/windows/service/exe/LxssUserSession.cpp
 @@ -383,6 +383,8 @@ HRESULT STDMETHODCALLTYPE LxssUserSession::RegisterDistribution(
@@ -618,16 +624,27 @@ index 9f3a355..d78dd7d 100644
                  WI_IsFlagClear(Flags, LXSS_IMPORT_DISTRO_FLAGS_NO_OOBE));
  
              configuration = s_GetDistributionConfiguration(registration, DistributionName == nullptr);
-@@ -2428,7 +2440,7 @@ void LxssUserSessionImpl::_CreateLegacyRegistration(_In_ HKEY LxssKey, _In_ HAND
+@@ -2428,7 +2440,18 @@ void LxssUserSessionImpl::_CreateLegacyRegistration(_In_ HKEY LxssKey, _In_ HAND
      const auto basePath = wsl::windows::common::filesystem::GetLegacyBasePath(UserToken);
  
      DistributionRegistration::Create(
 -        LxssKey, LXSS_LEGACY_DISTRO_GUID, LXSS_LEGACY_INSTALL_NAME, LXSS_DISTRO_VERSION_LEGACY, basePath.c_str(), configFlags, defaultUid, nullptr, LXSS_VM_MODE_VHD_NAME, false);
-+        LxssKey, LXSS_LEGACY_DISTRO_GUID, LXSS_LEGACY_INSTALL_NAME, LXSS_DISTRO_VERSION_LEGACY, basePath.c_str(), configFlags, defaultUid, nullptr, LXSS_VM_MODE_VHD_NAME, nullptr, nullptr, false);
++        LxssKey,
++        LXSS_LEGACY_DISTRO_GUID,
++        LXSS_LEGACY_INSTALL_NAME,
++        LXSS_DISTRO_VERSION_LEGACY,
++        basePath.c_str(),
++        configFlags,
++        defaultUid,
++        nullptr,
++        LXSS_VM_MODE_VHD_NAME,
++        nullptr,
++        nullptr,
++        false);
  
      _SetDistributionInstalled(LxssKey, LXSS_LEGACY_DISTRO_GUID);
  }
-@@ -2454,6 +2466,7 @@ std::vector<wsl::windows::common::filesystem::unique_lxss_addmount> LxssUserSess
+@@ -2454,6 +2477,7 @@ std::vector<wsl::windows::common::filesystem::unique_lxss_addmount> LxssUserSess
      return mounts;
  }
  
@@ -635,7 +652,7 @@ index 9f3a355..d78dd7d 100644
  _Requires_lock_not_held_(m_instanceLock)
  std::shared_ptr<LxssRunningInstance> LxssUserSessionImpl::_CreateInstance(_In_opt_ LPCGUID DistroGuid, _In_ ULONG Flags)
  {
-@@ -3987,6 +4000,8 @@ LxssUserSessionImpl::s_GetDistributionConfiguration(const DistributionRegistrati
+@@ -3987,6 +4011,8 @@ LxssUserSessionImpl::s_GetDistributionConfiguration(const DistributionRegistrati
  
      // Read the vhd file name and append to the base path.
      configuration.VhdFilePath = configuration.BasePath / Distro.Read(Property::VhdFileName);

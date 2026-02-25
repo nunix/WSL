@@ -5,6 +5,7 @@ nav:
     - 'Getting started':
        - 'Building and testing WSL': 'dev-loop.md'
        - 'Debugging WSL': 'debugging.md'
+       - 'BTRFS rootfs support': 'btrfs-rootfs.md'
     - 'WSL architecture':
        - 'Overview': technical-documentation/index.md
        - 'wsl.exe': technical-documentation/wsl.exe.md
