@@ -319,12 +319,16 @@ int ImportDistribution(_In_ std::wstring_view commandLine)
     std::filesystem::path filePath;
     ULONG flags = LXSS_IMPORT_DISTRO_FLAGS_NO_OOBE;
     DWORD version = LXSS_WSL_VERSION_DEFAULT;
+    std::optional<std::wstring> fsType;
+    std::optional<std::wstring> fsMountOptions;
 
     parser.AddPositionalArgument(name, 0);
     parser.AddPositionalArgument(AbsolutePath(installPath), 1);
     parser.AddPositionalArgument(filePath, 2);
     parser.AddArgument(WslVersion(version), WSL_IMPORT_ARG_VERSION);
     parser.AddArgument(SetFlag<ULONG, LXSS_IMPORT_DISTRO_FLAGS_VHD>{flags}, WSL_IMPORT_ARG_VHD);
+    parser.AddArgument(fsType, WSL_IMPORT_ARG_FS_TYPE);
+    parser.AddArgument(fsMountOptions, WSL_IMPORT_ARG_FS_MOUNT_OPTIONS);
 
     parser.Parse();
 
@@ -385,7 +389,15 @@ int ImportDistribution(_In_ std::wstring_view commandLine)
     {
         wsl::windows::common::HandleConsoleProgressBar progressBar(fileHandle, Localization::MessageImportProgress());
         wsl::windows::common::SvcComm service;
-        service.RegisterDistribution(name, version, fileHandle, installPath->c_str(), flags);
+        service.RegisterDistribution(
+            name,
+            version,
+            fileHandle,
+            installPath->c_str(),
+            flags,
+            std::nullopt,
+            fsType.has_value() ? fsType->c_str() : nullptr,
+            fsMountOptions.has_value() ? fsMountOptions->c_str() : nullptr);
     }
 
     directory_cleanup.release();
@@ -458,6 +470,8 @@ int Install(_In_ std::wstring_view commandLine)
     bool noDistribution = false;
     bool legacy = false;
     bool webDownload = IsWindowsServer();
+    std::optional<std::wstring> fsType;
+    std::optional<std::wstring> fsMountOptions;
 
     ArgumentParser parser(std::wstring{commandLine}, WSL_BINARY_NAME);
     parser.AddPositionalArgument(distroArgument, 0);
@@ -475,6 +489,8 @@ int Install(_In_ std::wstring_view commandLine)
     parser.AddArgument(g_promptBeforeExit, WSL_INSTALL_ARG_PROMPT_BEFORE_EXIT_OPTION);
     parser.AddArgument(SizeString(vhdSize), WSL_INSTALL_ARG_VHD_SIZE);
     parser.AddArgument(fixedVhd, WSL_INSTALL_ARG_FIXED_VHD);
+    parser.AddArgument(fsType, WSL_INSTALL_ARG_FS_TYPE);
+    parser.AddArgument(fsMountOptions, WSL_INSTALL_ARG_FS_MOUNT_OPTIONS);
 
     parser.Parse();
 
@@ -531,7 +547,9 @@ int Install(_In_ std::wstring_view commandLine)
             file,
             location.has_value() ? location->c_str() : nullptr,
             fixedVhd ? LXSS_IMPORT_DISTRO_FLAGS_FIXED_VHD : 0,
-            vhdSize);
+            vhdSize,
+            fsType.has_value() ? fsType->c_str() : nullptr,
+            fsMountOptions.has_value() ? fsMountOptions->c_str() : nullptr);
 
         wsl::windows::common::wslutil::PrintMessage(Localization::MessageDistributionInstalled(installedName.get()), stdout);
 
@@ -557,7 +575,7 @@ int Install(_In_ std::wstring_view commandLine)
     if (!noDistribution && (legacy || !rebootRequired))
     {
         auto result = WslInstall::InstallDistribution(
-            installResult, distroArgument, version, !noLaunchAfterInstall, webDownload, legacy, fixedVhd, name, location, vhdSize);
+            installResult, distroArgument, version, !noLaunchAfterInstall, webDownload, legacy, fixedVhd, name, location, vhdSize, fsType, fsMountOptions);
 
         std::optional<std::wstring> flavor;
         if (installResult.Distribution.has_value())
