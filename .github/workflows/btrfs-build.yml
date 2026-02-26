@@ -123,6 +123,14 @@ jobs:
             Write-Warning "Patch file not found at $patch – building without applying patch."
           }
 
+      # ── Check for local WSLg package override ─────────────────────────────
+      # Place nupkgs/Microsoft.WSLg.1.0.73.nupkg (built from nunix/wslg) to
+      # override the upstream package with one that includes mkfs.btrfs.
+      # See doc/docs/btrfs-rootfs.md – Section 5 for full instructions.
+      - name: Check local WSLg package
+        shell: pwsh
+        run: .\tools\Validate-LocalWSLg.ps1
+
       # ── Generate Visual Studio solution ────────────────────────────────────
       - name: Configure (CMake – x64)
         shell: cmd
@@ -177,6 +185,10 @@ jobs:
             }
           }
 
+      - name: Check local WSLg package
+        shell: pwsh
+        run: .\tools\Validate-LocalWSLg.ps1
+
       - name: Configure (CMake – ARM64)
         shell: cmd
         run: cmake . -A arm64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
@@ -223,6 +235,10 @@ jobs:
               git apply --whitespace=nowarn $patch
             }
           }
+
+      - name: Check local WSLg package
+        shell: pwsh
+        run: .\tools\Validate-LocalWSLg.ps1
 
       - name: Configure (CMake – x64)
         shell: cmd
@@ -283,6 +299,10 @@ jobs:
               git apply --whitespace=nowarn $patch
             }
           }
+
+      - name: Check local WSLg package
+        shell: pwsh
+        run: .\tools\Validate-LocalWSLg.ps1
 
       # Build ARM64 first (bundle requires it per CMake docs)
       - name: Configure (CMake – ARM64, Release, bundle mode)
