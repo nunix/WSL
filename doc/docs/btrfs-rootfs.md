@@ -1,9 +1,10 @@
 # BTRFS Rootfs Support for WSL2
 
 This document describes the BTRFS (and XFS) rootfs feature for WSL2, how to use
-it, how to reapply the patch on future upstream releases, and the complete
+it, how to reapply the patch on future upstream releases, the complete
 end-to-end workflow to build a distributable `msixbundle` from a GitHub Actions
-runner.
+runner, and how to supply a custom `nunix/wslg` package that includes the BTRFS
+tooling required at install time.
 
 ---
 
@@ -276,3 +277,139 @@ sudo btrfs subvolume list /
 # For btrfs – show filesystem usage:
 sudo btrfs filesystem usage /
 ```
+
+---
+
+## Section 5 – Custom WSLg Package (Local NuGet Override)
+
+### Why a custom WSLg package is needed
+
+When `wsl --install --fs-type btrfs` runs, the **WSLg system distro**
+(`system.vhd`) executes `mkfs.btrfs` to format the new VHD.  The official
+`Microsoft.WSLg` 1.0.73 package does not include this tool, so the install
+fails with:
+
+```
+/usr/sbin/mkfs.btrfs: No such file or directory
+```
+
+The solution is to build [nunix/wslg](https://github.com/nunix/wslg) — a fork
+that adds `btrfs-progs` (and other filesystem tools) to the system distro — and
+supply it to the WSL build as a local NuGet override.
+
+---
+
+### Files consumed from `Microsoft.WSLg`
+
+The WSL build reads these files from the NuGet package
+(`Microsoft.WSLg.1.0.73`). Your custom `.nupkg` **must** contain all of them:
+
+| Path inside nupkg | Description |
+|---|---|
+| `build/native/bin/x64/system.vhd` | x64 WSLg system distro VHD |
+| `build/native/bin/x64/WSLDVCPlugin.dll` | x64 Terminal Services DVC plugin |
+| `build/native/bin/arm64/system.vhd` | ARM64 WSLg system distro VHD |
+| `build/native/bin/arm64/WSLDVCPlugin.dll` | ARM64 Terminal Services DVC plugin |
+| `build/native/bin/wslg.rdp` | WSLg RDP session configuration |
+| `build/native/bin/wslg_desktop.rdp` | WSLg desktop RDP configuration |
+
+---
+
+### Step 1 – Build the custom WSLg package
+
+Follow the build instructions in [nunix/wslg](https://github.com/nunix/wslg)
+to produce a `Microsoft.WSLg.1.0.73.nupkg` that includes `btrfs-progs` in the
+system distro.  The typical steps are:
+
+```bash
+# Clone the fork (on a Linux host or inside a WSL distro)
+git clone https://github.com/nunix/wslg
+cd wslg
+
+# Build the system distro image (adds btrfs-progs, xfsprogs, etc.)
+# Follow the repo's own README for environment requirements.
+make package   # or the equivalent command documented in nunix/wslg
+
+# The resulting NuGet package will be at (adjust as appropriate):
+ls *.nupkg    # e.g. Microsoft.WSLg.1.0.73.nupkg
+```
+
+> **Version:** Keep the package ID and version exactly as
+> `Microsoft.WSLg` / `1.0.73` so it satisfies `packages.config` without
+> any changes to the build configuration.
+
+---
+
+### Step 2 – Place the package in `nupkgs/`
+
+Copy the produced `.nupkg` into the `nupkgs/` directory at the root of this
+repository:
+
+```powershell
+# From the repository root (Windows)
+Copy-Item path\to\Microsoft.WSLg.1.0.73.nupkg .\nupkgs\
+```
+
+The directory is tracked by git (via `.gitkeep`) but its contents are listed
+in `.gitignore`, so the large binary file will not be accidentally committed.
+
+---
+
+### Step 3 – Validate the package (optional but recommended)
+
+A helper script verifies that the package contains all required files before
+you start a lengthy build:
+
+```powershell
+# From the repository root
+.\tools\Validate-LocalWSLg.ps1
+```
+
+If the package is missing or has the wrong layout the script exits with a
+descriptive error.  If the file is absent entirely the script prints a warning
+and exits successfully, since the build will fall back to the upstream package.
+
+---
+
+### Step 4 – Build WSL normally
+
+No extra flags are needed.  The `nuget.config` at the repository root lists
+`./nupkgs` as the **highest-priority** source before the upstream WSL feed.
+When `Microsoft.WSLg.1.0.73.nupkg` is present in `nupkgs/`, NuGet's restore
+step picks it up automatically:
+
+```powershell
+# Generate the Visual Studio solution (x64 example)
+cmake . -A x64 -DCMAKE_BUILD_TYPE=Release
+
+# Build (takes 20–45 min)
+cmake --build . --config Release -- -m
+```
+
+---
+
+### Fallback behavior when the local package is absent
+
+If `nupkgs/Microsoft.WSLg.1.0.73.nupkg` does **not** exist, NuGet's restore
+falls through to the `WSL` source (the Azure DevOps feed) and downloads the
+official `Microsoft.WSLg` 1.0.73 package.  The build completes normally, but
+the resulting WSL installation will **not** have `mkfs.btrfs` in the system
+distro, so `wsl --install --fs-type btrfs` will fail at runtime.
+
+---
+
+### NuGet source priority (nuget.config)
+
+The `nuget.config` at the repository root is configured as follows:
+
+```xml
+<packageSources>
+    <clear />
+    <!-- Local feed checked first; falls back to WSL feed when absent -->
+    <add key="LocalWSLg" value="./nupkgs" />
+    <add key="WSL" value="https://pkgs.dev.azure.com/shine-oss/wsl/_packaging/WslDependencies/nuget/v3/index.json" />
+</packageSources>
+```
+
+NuGet evaluates sources in declaration order.  The local feed is listed first
+so any `.nupkg` placed in `nupkgs/` takes precedence over the upstream feed.
